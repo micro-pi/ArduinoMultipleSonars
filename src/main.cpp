@@ -116,6 +116,8 @@ public:
 
 #define READY_DATA_BIT ((uint8_t)(0x07u))
 #define TX_BUFFER_SIZE ((uint8_t)(DATA_5_L_CMD + 1))
+#define LOW_STATE_TIMEOUT_US (1000u)
+#define HIGH_STATE_TIMEOUT_US (20000u)
 
 static Sonar sonars[SONARS];
 static uint8_t txBuffer[TX_BUFFER_SIZE];
@@ -128,11 +130,7 @@ void resetSonars(void) {
   txBuffer[WHO_AM_I_CMD] = SLAVE_ADDR;
   txBuffer[RESET_CMD] = 0u;
   txBuffer[CONFIG_CMD] = 0u;
-  txBuffer[STATUS_CMD] = 0b00111111u;
-
-  for (size_t i = 0; i < SONARS; i++) {
-    sonars[i].enable(false);
-  }
+  txBuffer[STATUS_CMD] = 0u;
 
   sonars[0].setTrigPin(2);
   sonars[0].setEchoPin(3);
@@ -165,7 +163,7 @@ void resetSonars(void) {
     }
   }
 
-  counter = 0u;
+  counter = SONARS;
 }
 
 void receiveEvent(int howMany) {
@@ -176,8 +174,6 @@ void receiveEvent(int howMany) {
     Serial.println(command, HEX);
 
     switch (command) {
-      case WHO_AM_I_CMD:
-        break;
       case RESET_CMD:
         /* Reset Device */
         resetSonars();
@@ -191,21 +187,6 @@ void receiveEvent(int howMany) {
           txBuffer[CONFIG_CMD] = ((uint8_t)commandAttribute);
         }
         break;
-      case STATUS_CMD:
-      case DATA_0_H_CMD:
-      case DATA_0_L_CMD:
-      case DATA_1_H_CMD:
-      case DATA_1_L_CMD:
-      case DATA_2_H_CMD:
-      case DATA_2_L_CMD:
-      case DATA_3_H_CMD:
-      case DATA_3_L_CMD:
-      case DATA_4_H_CMD:
-      case DATA_4_L_CMD:
-      case DATA_5_H_CMD:
-      case DATA_5_L_CMD:
-      case EMPTY_CMD:
-        break;
 
       default:
         break;
@@ -216,6 +197,10 @@ void receiveEvent(int howMany) {
 void requestEvent(void) {
   if (command < TX_BUFFER_SIZE) {
     Wire.write(&txBuffer[command], (TX_BUFFER_SIZE - command));
+    if (command >= DATA_0_H_CMD) {
+      /* Clear READY_DATA_BIT if data requested */
+      txBuffer[STATUS_CMD] &= ~(1 << READY_DATA_BIT);
+    }
   } else {
     Wire.write(0);
   }
@@ -230,7 +215,9 @@ void setup() {
   Wire.onReceive(receiveEvent);
   Wire.onRequest(requestEvent);
 
+#ifdef DEBUG_MODE
   Serial.begin(115200);
+#endif
 }
 
 void loop() {
@@ -239,25 +226,31 @@ void loop() {
     txBuffer[STATUS_CMD] |= (1 << READY_DATA_BIT);
     for (size_t i = 0; i < SONARS; i++) {
       if (sonars[i].isEnabled() == true) {
+#ifdef DEBUG_MODE
         if (sonars[i].getDistanceMm() >= 0) {
-          // Serial.print("Distance[");
-          // Serial.print(i);
-          // Serial.print("] = ");
-          // Serial.print(sonars[i].getDistanceMm());
-          // Serial.println(" mm");
+          Serial.print("Distance[");
+          Serial.print(i);
+          Serial.print("] = ");
+          Serial.print(sonars[i].getDistanceMm());
+          Serial.println(" mm");
         } else {
-          // Serial.print("TIMEOUT [");
-          // Serial.print(i);
-          // Serial.print("] = ");
-          // Serial.println(sonars[i].getDistanceMm());
+          Serial.print("TIMEOUT [");
+          Serial.print(i);
+          Serial.print("] = ");
+          Serial.println(sonars[i].getDistanceMm());
         }
+#endif
       } else {
+        /* -2 - disabled */
         sonars[i].setDistanceMm(-2);
       }
       txBuffer[DATA_0_H_CMD + (i * 2)] = (uint8_t)(sonars[i].getDistanceMm() >> 8u);
       txBuffer[DATA_0_L_CMD + (i * 2)] = (uint8_t)(sonars[i].getDistanceMm());
     }
-    // Serial.println("-------------------");
+#ifdef DEBUG_MODE
+    Serial.println("-------------------");
+#endif
+
     delay(50);
 
     for (size_t i = 0; i < SONARS; i++) {
@@ -278,8 +271,8 @@ void loop() {
       }
     }
 
-    /* Clear READY_DATA_BIT */
-    txBuffer[STATUS_CMD] &= ~(1 << READY_DATA_BIT);
+    /* Clear status byte */
+    txBuffer[STATUS_CMD] = 0u;
     counter = 0;
 
     currentTime = micros();
@@ -306,7 +299,7 @@ void loop() {
               sonars[i].setTimeoutTime(currentTime);
               sonars[i].setState(READING_HIGH_STATE);
             } else {
-              if ((currentTime - sonars[i].getTimeoutTime()) > 1000) {
+              if ((currentTime - sonars[i].getTimeoutTime()) > LOW_STATE_TIMEOUT_US) {
                 sonars[i].setState(TIMEOUT_STATE);
               }
             }
@@ -317,7 +310,7 @@ void loop() {
               sonars[i].setEndTime(currentTime);
               sonars[i].setState(END_STATE);
             } else {
-              if ((currentTime - sonars[i].getTimeoutTime()) > 20000) {
+              if ((currentTime - sonars[i].getTimeoutTime()) > HIGH_STATE_TIMEOUT_US) {
                 sonars[i].setState(TIMEOUT_STATE);
               }
             }
@@ -326,11 +319,14 @@ void loop() {
           case END_STATE:
             sonars[i].setDistanceMm((int16_t)(((sonars[i].getEndTime() - sonars[i].getStartTime()) * 5) / 29));
             sonars[i].setState(PULSE_STATE);
+            txBuffer[STATUS_CMD] |= (1 << i);
             break;
 
           case TIMEOUT_STATE:
+            /* -1 - timeout */
             sonars[i].setDistanceMm((int16_t)(-1));
             sonars[i].setState(PULSE_STATE);
+            txBuffer[STATUS_CMD] |= (1 << i);
             break;
 
           default:
